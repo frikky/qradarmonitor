@@ -1,0 +1,16 @@
+[ 
+    {
+        "name": "",
+        "target": "",
+		"SEC": "",
+        "version": "",
+        "cert": "",
+		"domain": 0,
+        "subnet": [
+            "Alarm_Watchlist" 
+        ],
+        "rules": [{
+            "categories": "Network Sweep|!Firewall Deny"
+        }]
+    }
+]
