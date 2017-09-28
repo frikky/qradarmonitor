@@ -4,6 +4,8 @@ import discord
 import asyncio
 import logging
 
+import config as cfg
+
 client = discord.Client()
 
 @client.event
@@ -22,7 +24,6 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         msg = sys.argv[1]
     else:
-        "FAIL"
         sys.exit()
 
-    client.run('username', 'password')
+    client.run(cfg.discordname, cfg.discordpw)

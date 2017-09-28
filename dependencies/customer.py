@@ -33,3 +33,6 @@ class Customer(object):
     
         self.target_path = "https://%s/api/siem/offenses%s%s" % (target, self.fields, self.filters)
         self.new_version = True
+
+if __name__ == "__main__":
+    c = Customer("<example customer name>", "<example SEC token>")

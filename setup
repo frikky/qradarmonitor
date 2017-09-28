@@ -1,0 +1,16 @@
+#!/bin/sh
+# Used for docker instance
+
+apt update
+#apt-get dist-upgrade -y
+apt install -y python-software-properties software-properties-common 
+add-apt-repository ppa:jonathonf/python-3.6
+apt-get update
+
+apt install -y python3.6 python-pip wget
+
+wget https://bootstrap.pypa.io/get-pip.py
+python3.6 get-pip.py
+
+python3.6 -m pip install -U discord.py
+python -m pip install -U -r offense_api/requirements.txt

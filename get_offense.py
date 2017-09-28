@@ -4,7 +4,6 @@ import sys
 import ast
 import json
 import time
-import time
 import socket
 import logging
 import netaddr
@@ -12,17 +11,21 @@ import datetime
 import pickledb
 import requests
 import subprocess
+from thehive4py.api import TheHiveApi
+from thehive4py.models import Case, CaseTask, CaseObservable 
+
+import dependencies.config as cfg
+from dependencies.cortex_listener import cortex_listen
 
 """
-	The part below is setitng up default logging, 
-	certificates, disabling uneccesary warnings etc.
+    The part below is setitng up default logging, 
+    certificates, disabling uneccesary warnings etc.
 """
 dir_path = os.path.dirname(os.path.realpath(__file__))
 
 sys.path.append('%s/dependencies' % dir_path)
 from customer import Customer
 import urllib
-#from urllib import urllib.quote
 
 # Add multiple logging systems.
 requests.packages.urllib3.disable_warnings(\
@@ -50,21 +53,27 @@ logging.getLogger("requests").setLevel(logging.INFO)
 logging.getLogger("urllib3").setLevel(logging.INFO)
 
 json_time = 0
+resetcounter = 0
 
 class Offense(object):
     """
-		Class used for handling offenses and customers. 
-		Uses customer.py to handle each and every customer in the configuration file.
+        Class used for handling offenses and customers. 
+        Uses customer.py to handle each and every customer in the configuration file.
     """
+
     def __init__(self):
         self.customers = []
         self.db_status = False
-        self.mobile_db = ""
+        if cfg.TheHive:
+            self.hive = TheHiveApi("http://%s" % cfg.hiveip, cfg.hiveusername, 
+                            cfg.hivepassword, {"http": "", "https": ""})
+            self.cortex_log_path = "log/cortex_analysis.log"
+            self.cortex_listener = cortex_listen(self.cortex_log_path)
 
     # Function only in use when either customer_values.db does not exists or is empty
     def db_setup(self):
         """
-			Creates db for a customer if it doesn't exist.	
+	    Creates db for a customer if it doesn't exist.	
         """
         database = "%s/database/customer_values.db" % dir_path
         if not os.path.isfile(database):
@@ -77,12 +86,11 @@ class Offense(object):
             os.remove(database)
             logging.info("Creating database")
             self.db = pickledb.load(database, False)
-
         
     # Creates folders for customers.
     def create_customer_folder(self, customer_name):
         """
-			Creates a directory for a customer to save offenses. Used for backlogging.
+	    Creates a directory for a customer to save offenses. Used for backlogging.
         """
         customer_dir = "%s/database/customers/%s" % (dir_path, customer_name )
         if not os.path.exists(customer_dir):
@@ -92,7 +100,7 @@ class Offense(object):
     # Creates database for customer if it doesnt exist and SEC token exists
     def create_db(self, name):
         """
-			Uses pickledb to keep track of latest offenses.
+	    Uses pickledb to keep track of latest offenses.
         """
         self.db_setup()
         self.create_customer_folder(name)
@@ -109,7 +117,10 @@ class Offense(object):
 
     # Gets current time for print format.
     def get_time(self):
-        return time.strftime("%H:%M:%S")
+		# Workaround for wrong time
+        hourstr = time.strftime("%H")
+        hourint = int(hourstr)+2
+        return "%d:%s" % (hourint, time.strftime("%M:%S"))
 
     # Reloading the complete customers object for every iteration
     def add_customers(self, customer_json):
@@ -182,7 +193,7 @@ class Offense(object):
     # Uses Sveve for SMS sending
     def send_sms(self, message):
         """
-			Originally made to send an SMS with the message variable to a specific number.
+	    Originally made to send an SMS with the message variable to a specific number.
         """
         logging.info("%s: %s" % (self.get_time(), "Attempting to send sms"))
 
@@ -217,8 +228,7 @@ class Offense(object):
     # Runs the alarm
     def run_alarm(self, item, customer):
         """
-			Originally used to control on-screen, but later found to be annoying.
-			CUrrently not in use. 
+	    Originally used to control on-screen offenses, but later found to be annoying.
         """
         logging.info("%s: New highest offense - %s - customer %s, %s" % \
             (self.get_time(), item['id'], customer.name, item['categories']))
@@ -231,15 +241,6 @@ class Offense(object):
         logging.warning("%s: Sending alarm to %s" % (self.get_time(), customer.name))
         new_data = urllib.quote("Offense #%s: %s" % \
                             (item['id'], "\n".join(item['categories'])))
-
-        """
-        try:
-            requests.get("http://127.0.0.1:5000/notify?message=%s" % new_data, timeout=5)
-        except (requests.exceptions.ConnectionError,\
-                requests.exceptions.ReadTimeout,\
-                AttributeError) as e:
-            logging.warning("%s: %s" % (self.get_time(), e))
-        """
 
         # Return to only get one alarm at a time per customer.
         return False
@@ -256,35 +257,6 @@ class Offense(object):
         else:
             return request.json()
 
-    def id_to_ip(self, ID, id_list, customer, src_dst):
-        """
-			Finds an IP based on the ID injected through QRadar API calls.
-        """
-        ip_to_return = ""
-        if id_list.json()["number_of_elements"] is 0:
-            if src_dst == "src":
-                id_list = self.get_reflist(customer, customer.src_id_list)
-            elif src_dst == "dst":
-                id_list = self.get_reflist(customer, customer.dst_id_list)
-
-        if id_list.json()["number_of_elements"] is 0:
-            logging.info("%s: Reflist %s is empty" % (self.get_time(), id_list.json()["name"]))
-            return False
-
-        for item in id_list.json()["data"]:
-            if item["value"].startswith("%d" % ID):
-                ip_to_return = ast.literal_eval(("{"+item["value"]+"}").replace("'", "\""))
-                if type(ip_to_return) is dict:
-                    try:
-                        return ip_to_return[ID]
-                    except KeyError as e:
-                        return False
-                else:
-                    return False
-
-        return False
-
-
     # Removes the "Range" header for some specific API calls.
     def remove_range_header(self, customer):
         """
@@ -299,160 +271,46 @@ class Offense(object):
         return headers
 
     # If it doesn't exist already
-    def find_ip(self, customer, ID, headers):
+    def find_ip(self, customer, ID, headers, src_dst="src"):
         """
 			Finds and IP based on ID.
 			Almost same as above, but not in bulk.
         """
-        target_path = "https://%s/api/siem/source_addresses" % customer.target
+        search_field = ""
+        find_ip = ""
+
+        if src_dst == "dst":
+            src_dst = "local_destination_addresses" 
+            search_field = "local_destination_ip"
+        else:
+            src_dst = "source_address_ids" 
+            search_field = "source_ip"
+
+        target_path = "https://%s/api/siem/%s" % (customer.target, src_dst)
+        header = self.remove_range_header(customer)
 
         try:
-            find_ip = requests.get(target_path+"/%s?fields=id,source_ip" % \
-                str(ID), headers=headers, timeout=5, verify=False)
+            find_ip = requests.get(target_path+"/%s?fields=id%s%s" % \
+                (str(ID), "%2C", search_field), headers=header, timeout=5, verify=False)
         except (requests.exceptions.ConnectionError,\
                 requests.exceptions.ReadTimeout,\
                 AttributeError) as e:
             logging.warning("%s: %s" % (self.get_time(), e))
 
         try:
-            ret_val = find_ip.json()["source_ip"]
-        except KeyError as e:
+            ret_val = find_ip.json()[search_field]
+        except (KeyError, UnboundLocalError) as e:
             ret_val = False
 
         return ret_val
 
-    def create_single_ID(self, customer, ID, src_dst):
-        """
-			Creates an ID based on an IP.	
-        """
-        headers = self.remove_range_header(customer)
-
-        src_ID = "https://%s/api/siem/%s" % (customer.target, "source_addresses" \
-                 if src_dst == "src" else "local_destination_addresses")
-        
-        ip = self.find_ip(customer, ID, headers)
-
-        if ip is False:
-            return 
-        
-        try:
-            add_ID_to_set = requests.post(\
-                "https://%s/api/reference_data/sets/%s?value=%s: '%s'" \
-                % (customer.target, customer.src_id_list if src_dst == "src" else customer.dst_id_list, ID, ip), \
-                headers=headers, timeout=5, verify=False)
-        except (requests.exceptions.ConnectionError,\
-                requests.exceptions.ReadTimeout,\
-                AttributeError) as e:
-            logging.warning("%s: %s" % (self.get_time(), e))
-
-
-    # Creates a bulk of items (if list is empty)
-    def create_ID_list(self, customer, id_list_name, src_dst):
-        """
-			Creates a bulk of items and pushes them to specified 
-			reference set for bulk extraction. Deprecated.
-        """
-        ID_arr = []
-        headers = self.remove_range_header(customer)
-        req = ""
-        
-        if src_dst is "src":
-            field = "source_ip" 
-            src_ID = "https://%s/api/siem/source_addresses%s" % (customer.target, src_ID_fields)
-        elif src_dst is "dst":
-            field = "local_destination_ip"
-            src_ID = "https://%s/api/siem/local_destination_addresses" % customer.target
-
-        # Bulkloading from src/dst IDs available.
-        #try:
-        #print "Making request %s" % src_ID
-        req = requests.get(src_ID, headers=headers, timeout=10, verify=False)
-        #except (requests.exceptions.ConnectionError,\
-        #        requests.exceptions.ReadTimeout,\
-        #        AttributeError) as e:
-        #    logging.warning("%s: %s" % (self.get_time(), e))
-
-        #print req.json()
-        #print id_list_name
-        sys.exit()
-        if not req:
-            return False  
-
-
-        for items in req.json():
-            ID_arr.append(items["id"])
-
-        # Bulkpushing to reference set specified in customer.json
-        cnt = 0
-        IP_arr = []
-        for item in ID_arr:
-            try:
-                url = src_ID+"/%s?fields=%s" % (str(item), field)
-                req = requests.get(url, headers=headers, timeout=5, verify=False)
-            except (requests.exceptions.ConnectionError,\
-                    requests.exceptions.ReadTimeout,\
-                    AttributeError) as e:
-                logging.warning("%s: %s" % (self.get_time(), e))
-
-            #if cnt is 0: 
-                #print "Done in approx "+str(len(ID_arr)*req.elapsed.total_seconds()) + "seconds."
-                    
-            IP_arr.append("\""+str(item)+": " + "\'" + req.json()[field]+"\'\"")
-            cnt += 1
-
-        data = "["+", ".join(IP_arr)+"]"
-        
-        new_url = "https://%s/api/reference_data/sets/bulk_load/%s" % (customer.target, id_list_name)
-
-        try:
-            req = requests.post("%s" % new_url, data=str(data), headers=headers, timeout=5, verify=False)
-        except (requests.exceptions.ConnectionError,\
-                requests.exceptions.ReadTimeout,\
-                AttributeError) as e:
-            logging.warning("%s: %s" % (self.get_time(), e))
-
-        try:
-            if req.json()["message"].startswith("User has"):
-            	msg = "Missing permissions for %s in ref set %s" % (customer.name, id_list_name)
-            	if len(sys.argv) > 1:
-            		if sys.argv[1] == "--verbose" or sys.argv[1] == "-v":	
-            			print(msg)
-            	self.write_offense_log(msg) 
-				
-        except KeyError as e:
-            logging.warning("Added to db %s for %s" % (id_list_name, customer.name))
-
-        return ID_arr
-        
-
-    # Creates a list of IDs
-    def get_ID_list_keys(self, customer, id_request, id_list_name, src_dst):
-        """
-			Returns a list of IDs based on input	
-        """
-        id_list = []
-
-        if id_request.json()["number_of_elements"] is 0:
-            id_list = self.create_ID_list(customer, id_list_name, src_dst)
-
-        if not id_list:
-            try:
-                for data in id_request.json()["data"]:
-                    id_list.append(str(data["value"]).split(":")[0])
-            except KeyError as e:
-                logging.warning("%s: %s" % (self.get_time(), e))
-                return False
-
-        return id_list
-
     # Gets the a list of IDs related to IPs 
     def get_reflist(self, customer, ref_name):
         """
-			Gets the actual data used to correlate with customer.json rules.
+            Gets the actual data used to correlate with customer.json rules.
         """
         fields = ""
         headers = self.remove_range_header(customer)
-        #    fields = "?fields=source_ip"
         
         ref_list = "https://%s/api/reference_data/sets/%s" % (customer.target, ref_name) 
 
@@ -467,7 +325,7 @@ class Offense(object):
 
     def get_network_list(self, network_list):
         """
-			Finds the list of networks that are more valuable (e.g. server network)
+	    Finds the list of networks that are more valuable (e.g. server network)
         """
         arr = []
         for subnet in network_list:
@@ -478,7 +336,7 @@ class Offense(object):
     # Returns 
     def get_affected_subnet(self, req, customer, network_list, id_list_name, src_dst):
         """
-			Checks if the network found in an offense is part of the actual subnet
+            Checks if the network found in an offense is part of the actual subnet
         """
         affected_subnet = []
         headers = self.remove_range_header(customer)
@@ -496,10 +354,12 @@ class Offense(object):
             url = base_url+str(ID)+fields
             cnt = 0
 
-            # Loop through CIDR ranges
-            #ip = self.id_to_ip(ID, global_ip_ids, customer, src_dst)
 
-            ip = requests.get(url, headers=headers, verify=False)
+            try:
+                ip = requests.get(url, headers=headers, verify=False, timeout=5)
+            except requests.exceptions.ConnectionError:
+                continue
+
             try:
                 ip = ip.json()[ip_variable]
             except KeyError as e:
@@ -516,36 +376,16 @@ class Offense(object):
                     cnt += 1
 
         return False
-        #return affected_subnet
-
 
     # Verifies alarms related to reference lists
     def verify_reflist(self, customer, req):
         """
-			Verifies multiple reference set alarms. 
+            Verifies multiple reference set alarms. 
         """
-        #self.verify_direction(customer, req)
 
         id_list = ["source_address_ids", "local_destination_address_ids"]
     
         affected_subnet = []
-        # Get global source_address_ids first
-
-        """
-        # Remove because of change of plans \o/
-        src_ip_ids = self.get_reflist(customer, customer.src_id_list)
-        dst_ip_ids = self.get_reflist(customer, customer.dst_id_list)
-
-        # Need admin access? Wat
-        # ALRIGHTY THEN
-        if not src_ip_ids.status_code is 200 or not src_ip_ids.status_code is 200:
-            print "Might be insufficient permissions for %s" % customer.name
-            print "%s: %s" % (self.get_time(), src_ip_ids.json()["message"])
-            return False
-
-        src_ID_list = self.get_ID_list_keys(customer, src_ip_ids, customer.src_id_list, "src")
-        dst_ID_list = self.get_ID_list_keys(customer, dst_ip_ids, customer.dst_id_list, "dst")
-        """
 
         # List of subnets to check
         for ref_set_list in customer.ref_list:
@@ -583,16 +423,15 @@ class Offense(object):
                     network_list, "local_destination_address_ids", "dst")
 
             if dst_affected_subnet:
-                #sys.stdout.write("SUBNET %s. " % src_affected_subnet)
                 return True
 
         return False
 
     def check_alarm(self, ID, customer):
         """
-			Verifies an ID, if it's new etc. Bulk loads and checks if the lowest number 
-			is greater than the oldest saved one.
-			The horrible forloop verifies if rules are matched based on rules in customer.json
+            Verifies an ID, if it's new etc. Bulk loads and checks if the lowest number 
+            is greater than the oldest saved one.
+            The horrible forloop verifies if rules are matched based on rules in customer.json
         """
         fields = ""
         valid = True 
@@ -606,6 +445,7 @@ class Offense(object):
                 requests.exceptions.ReadTimeout,\
                 AttributeError) as e:
             logging.warning("%s: %s" % (self.get_time(), e))
+            return False
 
         if req.status_code != 200:
             logging.warning("%s Unable to retrieve %s" % (self.get_time(), customer.target))
@@ -673,56 +513,12 @@ class Offense(object):
     # Verify ID here
     def add_new_ID(self, customer, request):
         path = "database/customers/%s/%s" % (customer.name, str(request.json()["id"]))
+
         if not os.path.exists(path):
             with open(path, "w+") as tmp:
                 json.dump(request.json(), tmp)
 
         logging.info("%s: Added new offense to %s" % (self.get_time(), path))
-
-
-    # Kibana communcation for visualization
-    def create_socket(self, customer, new_req):
-        values = []
-        keys = ["description", "id", "event_count", "source_network", "destination_network", "username_count", "categories"]
-        values.append(customer.name)
-        for key, value in new_req.json().iteritems():
-            if not key in keys:
-                continue
-
-            #print key, value
-            if isinstance(value, list):
-                new_arr = []
-                for items in value:
-                    new_arr.append(items if isinstance(items, int) else str(items)) 
-
-                value = new_arr
-
-            word = ""
-            for char in str(value):
-                if not char == "\n":
-                    word += char 
-                    
-            values.append(word.encode("utf-8"))
-
-
-        msg = new_req.text
-        target = '172.28.3.23'
-        port = 1999
-
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.connect((target, port))
-            s.send(",".join(values))
-            s.close()
-        except socket.error as e:
-            #print "Socket error %s" % e
-            logging.warning("Socket error %s" % e)
-            return
-
-
-        #print "QUITTING AT SOCKET (KIBANA)"
-        ##### TEST
-        sys.exit()
 
     # DISCORD SETUP 
     def discord_setup(self, ID, msg):
@@ -731,6 +527,7 @@ class Offense(object):
         subprocess.call(" ".join(call), shell=True)
         logging.info("%s: Message sent to discord server." % self.get_time())
 
+    # BEST LOGGER AYY \o/ LMAO
     def write_offense_log(self, data):
         with open("log/offense.log", "a") as tmp:
             try:
@@ -738,9 +535,231 @@ class Offense(object):
             except UnicodeEncodeError as e:
                 tmp.write("\nError in parsing data.\n%s" % e)
 
-# Verifies the ID, and returns if it's not a new incident.
+    # Returns tasklist based on casetitle
+    def get_hive_task_data(self, data):
+        # Reload every time so it's editable while running.
+        with open(cfg.incident_task, "r") as tmp:
+            cur_data = json.load(tmp)
+
+        # Is cur_data["description"] in data["description"]:
+        for item in json.load(open(cfg.incident_task, "r"))["ruleslist"]:
+            if item["description"].lower() in data["description"].lower():
+                return item["result"]
+
+    # Checks the normal local subnet ranges. Theres like 7 missing.
+    def check_local_subnet(self, ip_address):
+        # Returns false if ip not a local address 
+        # Yes I know there are more..
+        local_ranges = [
+            "192.168.0.0/16",
+            "172.16.0.0/12",
+            "10.0.0.0/8"
+        ]
+
+        for item in local_ranges:
+            if netaddr.IPAddress(ip_address) in netaddr.IPNetwork(item): 
+                return False 
+
+        return True 
+
+    # IP verification lmao
+    def verify_offense_source(self, input):
+        try:
+            netaddr.IPAddress(str(input))
+            if not self.check_local_subnet(input):
+                return False
+
+            return True
+        except netaddr.core.AddrFormatError:
+            return False
+
+    # Returns all IPs in an offense by ID
+    def get_ip_data(self, customer, data):
+        verify_local_ip = [] 
+
+        # Should prolly cache this data.
+        # Finds IPs based on and ID - destination
+        if data["local_destination_count"] > 0:
+            for item in data["local_destination_address_ids"]:
+                ip_output = self.find_ip(customer, item, customer.header, "dst")
+                if ip_output:
+                    if ip_output not in verify_local_ip and self.check_local_subnet(ip_output):
+                        verify_local_ip.append(str(ip_output))
+
+        # Finds IPs based on and ID - source 
+        if data["source_count"] > 0:
+            for item in data["source_address_ids"]:
+                ip_output = self.find_ip(customer, item, customer.header)
+                if ip_output:
+                    if ip_output not in verify_local_ip and self.check_local_subnet(ip_output):
+                        verify_local_ip.append(str(ip_output))
+
+        return verify_local_ip
+
+    # Only created for IP currently.
+    # Hardcoded for QRadar
+    def get_hive_cases(self, customer, data):
+        # Offense doesn't return all the IP-addresses.
+        verify_local_ip = self.get_ip_data(customer, data)
+        find_source = self.verify_offense_source(data["offense_source"])
+        
+        # Adds offense source if IP observed
+        if find_source:
+            verify_local_ip.append(str(data["offense_source"]))
+
+        # Returns if no observables found
+        # Also means a case will not be created.
+        if not verify_local_ip:
+            return False
+
+        # Check basic case details first. Customername > Name of offense > category
+        # Might be able to search title field for customer name as well. Tags can also be used.
+        allcases = self.hive.find_cases(query={"_field": "status", "_value": "Open"})
+        customer_caselist = []
+
+        # Finds all the specified customers cases
+        for item in allcases.json():
+            if customer.name.lower() in item["title"].lower():
+                customer_caselist.append(item)
+
+        # Creates a case if no cases are found. Returns list of observed IoCs for case creation
+        if not customer_caselist:
+            return verify_local_ip 
+
+        use_case = ""
+        casename = ""
+        # Looks for exact casename match 
+        for case in customer_caselist:
+            casetitle = case["title"].split(" - ")[1]
+            if casetitle == data["description"]:
+                use_case = case
+                break
+
+        if use_case:
+            not_matching = []
+            matching_categories = data["categories"]
+
+        # Try to match two categories if exact name match isn't found
+        if not use_case:
+            # Least amount of categories needed to match
+            category_match_number = 2
+
+            category_counter = 0
+            for case in customer_caselist:
+                matching_categories = []
+                not_matching = []
+                for category in data["categories"]: 
+                    if category in case["tags"]:
+                        matching_categories.append(category)
+                    else:
+                        not_matching.append(category)
+
+                if len(matching_categories) > (category_match_number-1):
+                    use_case = case
+                    break
+
+        # Will create a new case if observable found and no similar case.
+        if not use_case:
+            return verify_local_ip 
+                 
+        # FIX - Hardcoded datatype
+        datatype = "ip"
+        actual_data = []
+
+        # Finds actual observables for the specified case
+        observables = [x["data"] for x in self.hive.get_case_observables(\
+            use_case["id"]).json() if x["dataType"] == datatype]
+
+        # Finds if observable exists in previous list
+        actual_data = [x for x in verify_local_ip if not x in observables]
+
+        # FIX - check logic here. Might need to add tags etc (offenseID) etc.
+        # Only appends data if new observables are detected
+        if not actual_data:
+            return False
+
+        # Defines what categories to append
+        category_breaker = ""
+        if not_matching:
+            category_breaker = not_matching
+        else:
+            category_breaker = matching_categories
+            
+        self.add_observable_data(use_case["id"], actual_data, datatype, data, not_matching) 
+
+        # False to not create another case
+        return False
+
+    # Add by caseid and list of specified datatype and a QRadar offense
+    def add_observable_data(self, case_id, observables, datatype, data, category):
+        observable_items = []
+        data_items = []
+
+        tags = [str(data["id"])]
+        tags.extend(category)
+
+        for item in observables:
+            observable = CaseObservable(
+                dataType=datatype,
+                data=item,
+                tlp=0,
+                ioc=True,
+                tags=tags,
+                message="Possible IoC"
+            )
+
+            # Creates the observable
+            ret = self.hive.create_case_observable(case_id, observable)
+            if ret.ok:
+                observable_items.append(ret.json())
+                data_items.append(item)
+            else:
+                continue
+
+        if data_items:
+            self.cortex_listener.run_cortex_analyzer(datatype, data_items, observable_items)
+
+    # TheHive case creation
+    def create_hive_case(self, customer, data):
+        create_hive_bool = self.get_hive_cases(customer, data)
+
+        # Returns if case already merged.
+        if not create_hive_bool:
+            return False
+
+        # Baseline for creating a case
+        title = ("%s: %s - %s" % (customer.name, str(data["id"]), data["description"]))
+	static_task = "Why did it happen? Check rule.",
+        task_data = self.get_hive_task_data(data)
+        tasks = [
+            CaseTask(title=static_task)
+        ]
+        if task_data:
+            for item in task_data:
+                tasks.append(CaseTask(title=item))
+
+        # Creates a case object
+        case = Case(title=title, tlp=0, flag=False, tags=data["categories"], \
+                description=data["description"], tasks=tasks)
+
+        # Creates the actual case based on prior info
+        ret = self.hive.create_case(case)
+
+        if ret.ok:
+            # FIX, datatype is static
+            self.add_observable_data(ret.json()["id"], create_hive_bool, \
+                "ip", data, data["categories"])
+            return True 
+
+        return False
+
+    # Verifies the ID, and returns if it's not a new incident.
     def verify_ID(self, request, customer):
         # In case there are no offenses related to customer. Basically domain management.
+        # Attempts to reanalyze in case of failed analysis jobs
+
+        #self.cortex_listener.find_failed_cortex_jobs()
+
         try:
             if float(customer.version) < 7.0:
                 try:
@@ -785,30 +804,17 @@ class Offense(object):
                 target = "https://%s/api/siem/offenses/%s" % (customer.target, str(i))
                 new_header = self.remove_range_header(customer)
 
-                # Try / catch all the things
                 try:
                     new_req = requests.get(target, headers=new_header, timeout=5, verify=False)
                 except requests.exceptions.ConnectionError as e:
                     logging.warning("Internal alarmserver might be down: %s" % e)
+                    continue
                 except requests.exceptions.ReadTimeout as e:
-                    logging.warning("Timeout" % e)
-                    #requests.get("http://127.0.0.1:5000/notify?ip=%s&id=%s&message=New unknown offense")
-
+                    logging.warning("Timeout %s" % e)
+                    continue
                 # Appends current offense to database/customers/customer/ID in json format. 
                 # This is to backtrack 
-                self.add_new_ID(customer, new_req)
-
-                # Kibana - uncomment to send (requires the server to be available)
-                #self.create_socket(customer, new_req)
-
-                # Adds to warning dumb if time is right.
-                if self.mobile_db:
-                    logging.info("%s: %s" % (self.get_time(), "HALLELUJA"))
-                    self.mobile_db.set(customer.name, int(self.mobile_db.get(customer.name))+1)
-                    self.mobile_db.dump()
-                    #logging.warning("%s: %s" % (self.get_time(), e))
-
-                #msg_arr.append(customer["name"]+": "+str(self.mobile_db.get(customer["name"])))
+                ID_ret = self.add_new_ID(customer, new_req)
                 new_req = new_req.json()
 
                 try: 
@@ -823,18 +829,6 @@ class Offense(object):
                     new_data = urllib.quote("Offense #%s: %s" % (str(i), "Arbitrary categories"))
 
                 # Sends a local alarm if an alarmserver is running on the current system. 
-                # Should be made into a function with (ip, id, message) as parameteres.
-                # Loop through all current systems.
-                """
-                try:
-                    internal = requests.get("http://127.0.0.1:5000/notify?ip=%s&id=%s&message=%s" \
-                                 % (customer.target, i, new_data), timeout=5)
-                except requests.exceptions.ConnectionError as e:
-                    #print "%s: Internal alarmserver might be down: %s" % (self.get_time(), e)
-                    logging.warning("Internal alarmserver might be down: %s" % e)
-                except requests.exceptions.ReadTimeout as e:
-                    logging.warning("Timeout" % e)
-                """
 
                 # Prints to screen. Try/catch only in case of errors.
                 try:
@@ -851,13 +845,15 @@ class Offense(object):
                 except KeyError as e:
                     logging.warning("%s: KeyError: %s" % (self.get_time(), e))
 
-                
-                # self.discord_setup(str(i), ", ".join(new_req['categories']))
-                # Adding the new offense to the database, as well as 
+                if cfg.TheHive:
+                    self.create_hive_case(customer, new_req) 
+                if cfg.discordname and cfg.discordpw:
+                    self.discord_setup(str(i), ", ".join(new_req['categories']))
+
                 # verifying if an alarm should be triggered.
                 difference = json_id-self.db.llen(customer.name)-1
 
-                ## REMOVE COMMENT TO UPDATE DB
+                # Adds data to the DB
                 cur_array.append(i)
 
                 alarm_check = self.check_alarm(i, customer)
@@ -874,9 +870,10 @@ class Offense(object):
                 
         else:
             return False
-
+	
     # Reload json every time, and check it to prevent failures. verify_json(self, x) 
     def check_connection(self):
+        global resetcounter
         for customer in self.customers:
             self.db.dump()
             domain_field = ""
@@ -899,9 +896,8 @@ class Offense(object):
                     requests.exceptions.ReadTimeout,\
                     AttributeError) as e:
                 try:
-                    logging.info("%s: Connection failure %s. \
-                                Waiting 10 minutes for %s." % \
-                                (self.get_time(), e, customer.name))
+                    logging.info("%s: Connection failure for %s" % \
+                                (self.get_time(), customer.name))
                     continue
                 except TypeError as e:
                     logging.warning("%s" % e)
@@ -923,101 +919,21 @@ class Offense(object):
             if not verify_request: 
                 continue
 
-
-    ### OUTSIDE WORK REPORT
-    # Appends customers
-    def add_mobile_db(self, name):
-        self.mobile_db.lcreate(name)
-        self.mobile_db.set(name, 0)
-        self.mobile_db.dump()
-        logging.info("%s Initialized mobile database for %s" % (self.get_time(), name))
-
-    # DB setup woo
-    def mobile_db_setup(self):
-        logging.info("%s: %s" % (self.get_time(), "initializing mobile db."))
-        database = "database/mobile_values.db"
-        if not os.path.isfile(database):
-            open(database, 'w+').close()
-
-        try:
-            self.mobile_db = pickledb.load(database, False)
-        except pickledb.simplejson.scanner.JSONDecodeError:
-            self.remove_mobile_db(database)
-            logging.info("Creating mobile database")
-            self.mobile_db = pickledb.load(database, False)
-
-        with open("database/customer.json", "r") as tmp:
-            customer_json = json.loads(tmp.read()) 
-
-        for customer in customer_json:
-            self.add_mobile_db(customer["name"])
-
-    # Returns offensecount loaded
-    def get_mobile_offenses(self):
-        msg = ""
-        msg_arr = []
-
-        self.mobile_db = pickledb.load("database/mobile_values.db", False)
-
-        for customer in json.loads(open("database/customer.json", "r").read()):
-            msg_arr.append(customer["name"]+": "+str(self.mobile_db.get(customer["name"])))
-
-        #self.mobile_db.add(self.mobile_db.get(customer.name)+1)
-
-        msg = ", ".join(msg_arr)
-    
-    def remove_mobile_db(self, db):
-        os.remove(db)
-
-    # SMS with offenseoverview PROD
-    def get_date(self):
-        now = time.strftime("%H") 
-        weekday = datetime.datetime.today().weekday()
-        cur_db = "database/mobile_values.db"
-
-        # Turns off the alarm system
-        if self.db_status is True:
-            if weekday is 0 and int(now) is 7:
-                msg = self.get_mobile_offenses()
-                self.send_sms(msg)
-
-                self.db_status = False
-                self.remove_mobile_db(cur_db)
-                self.mobile_db = ""
-            return
-
-        # Turns on the alarm system
-        if weekday is 4 and int(now) >= 16:        
-            if self.db_status is False:
-                if os.path.isfile(cur_db):
-                    self.remove_mobile_db(cur_db)
-                    logging.debug("%s: %s" % (self.get_time(), "Removing db"))
-
-                self.mobile_db_setup()
-                self.db_status = True    
-
-
-    # SMS with offenseoverview PROD
-
 def loop():
     """
-		Loops about every minute, base
+        Loops about every minute, base
     """
     t = Offense()
-
     msg = "%s: Server starting" % t.get_time()
+
     if len(sys.argv) > 1:
         if sys.argv[1] == "--verbose" or sys.argv[1] == "-v":	
         	print(msg)
-    else:
-        print("\nOffenses can be found in %s. Use -v for verbose mode." % "./log/offense.log")
 
     t.write_offense_log(msg) 
-
     logging.info("%s: Restarting script" % time.strftime("%Y:%M:%d, %H:%M:%S"))
+
     while(1):
-        # Check for time
-        t.get_date()
         test = t.load_objects()
         t.check_connection()
         time.sleep(60)
@@ -1032,14 +948,3 @@ if __name__ == "__main__":
             sys.exit(0)
         except SystemExit:
             os._exit(0)
-
-    # Code used for testing purposes
-    """
-    t = Offense()
-    with open("database/customer.json", "r") as tmp: 
-        for item in json.load(tmp):
-			# Change name to an appropriate customer name to test..
-            if item["name"] == "customer_name":
-                customer = Customer(item["name"], item["SEC"], item["target"], item["version"], item["rules"], item["subnet"], item["src_id_list"], item["dst_id_list"], item["cert"])
-                t.check_alarm(offenseID, customer) 
-    """

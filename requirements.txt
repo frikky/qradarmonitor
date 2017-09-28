@@ -1,3 +1,5 @@
 requests
 netaddr
 pickledb
+thehive4py
+libmagic
